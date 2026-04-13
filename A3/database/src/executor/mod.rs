@@ -47,6 +47,7 @@ fn equi_join_keys(
 ) -> Vec<(usize, usize)> {
     let mut keys = Vec::new();
     for pred in predicates {
+        if !matches!(pred.operator, common::query::ComparisionOperator::EQ) { continue; }
         if let ComparisionValue::Column(rhs_name) = &pred.value {
             let li = left_schema.iter().position(|(n, _)| n == &pred.column_name);
             let ri = right_schema.iter().position(|(n, _)| n == rhs_name);
