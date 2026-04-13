@@ -37,7 +37,6 @@ impl<'q> Operator<'q> for FilterOperator<'q> {
     }
 
     fn next(&mut self) -> Option<Row> {
-        // Keep pulling from child until we find a passing row or exhaust it.
         loop {
             let row = self.child.next()?;
             if self.passes_all(&row) {
@@ -50,11 +49,9 @@ impl<'q> Operator<'q> for FilterOperator<'q> {
 // ── Predicate evaluation ──────────────────────────────────────────────────────
 
 fn evaluate_predicate(row: &Row, schema: &Schema, pred: &Predicate) -> bool {
-    // Resolve LHS column index
     let lhs_idx = column_index(schema, &pred.column_name);
     let lhs = &row[lhs_idx];
 
-    // Resolve RHS value
     let rhs: Data = match &pred.value {
         ComparisionValue::Column(name) => row[column_index(schema, name)].clone(),
         ComparisionValue::I32(v) => Data::Int32(*v),
@@ -64,21 +61,67 @@ fn evaluate_predicate(row: &Row, schema: &Schema, pred: &Predicate) -> bool {
         ComparisionValue::String(s) => Data::String(s.clone()),
     };
 
-    let cmp = lhs.partial_cmp(&rhs);
-
     match &pred.operator {
-        ComparisionOperator::EQ => lhs == &rhs,
-        ComparisionOperator::NE => lhs != &rhs,
-        ComparisionOperator::GT => matches!(cmp, Some(std::cmp::Ordering::Greater)),
+        ComparisionOperator::EQ => data_eq(lhs, &rhs),
+        ComparisionOperator::NE => !data_eq(lhs, &rhs),
+        ComparisionOperator::GT => matches!(data_cmp(lhs, &rhs), Some(std::cmp::Ordering::Greater)),
         ComparisionOperator::GTE => matches!(
-            cmp,
+            data_cmp(lhs, &rhs),
             Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
         ),
-        ComparisionOperator::LT => matches!(cmp, Some(std::cmp::Ordering::Less)),
+        ComparisionOperator::LT => matches!(data_cmp(lhs, &rhs), Some(std::cmp::Ordering::Less)),
         ComparisionOperator::LTE => matches!(
-            cmp,
+            data_cmp(lhs, &rhs),
             Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
         ),
+    }
+}
+
+// ── Mixed-type numeric comparison ─────────────────────────────────────────────
+//
+// The common::Data PartialOrd / PartialEq implementations only handle
+// *same-variant* comparisons and return None / false for mixed types.
+//
+// In practice, a query may have a Float64 column with an I32 literal (e.g.
+// `l_quantity <= 10` where the column is Float64 but the literal is I32(10)).
+// We resolve this by coercing both sides to f64 for numeric types.
+// Strings are only compared to strings.
+
+/// Order comparison that handles mixed numeric types via f64 coercion.
+fn data_cmp(a: &Data, b: &Data) -> Option<std::cmp::Ordering> {
+    // Fast path: same variant — use the PartialOrd impl from common.
+    if let Some(ord) = a.partial_cmp(b) {
+        return Some(ord);
+    }
+    // Slow path: try coercing both to f64.
+    match (to_f64(a), to_f64(b)) {
+        (Some(x), Some(y)) => x.partial_cmp(&y),
+        _ => None, // e.g. String vs numeric — incomparable
+    }
+}
+
+/// Equality check that handles mixed numeric types.
+fn data_eq(a: &Data, b: &Data) -> bool {
+    // Fast path: same variant.
+    if a == b {
+        return true;
+    }
+    // Slow path: numeric coercion.
+    match (to_f64(a), to_f64(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Try to represent a Data value as f64 (for mixed-type numeric comparisons).
+/// Returns None for non-numeric types (String).
+fn to_f64(v: &Data) -> Option<f64> {
+    match v {
+        Data::Int32(x) => Some(*x as f64),
+        Data::Int64(x) => Some(*x as f64),
+        Data::Float32(x) => Some(*x as f64),
+        Data::Float64(x) => Some(*x),
+        Data::String(_) => None,
     }
 }
 
