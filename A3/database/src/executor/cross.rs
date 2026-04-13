@@ -1,32 +1,36 @@
 use crate::executor::{Operator, SharedDisk};
-use crate::row::{Row, Schema};
+use crate::row::{decode_block, encode_row, Row, Schema};
 
 /// Computes the Cartesian product of two child relations.
 ///
-/// Strategy: materialise the **right** child entirely into memory on the first
-/// `next()` call, then stream the left child one row at a time.  For each left
-/// row, we yield `left_row ++ right_row` for every buffered right row.
+/// Strategy: spill the RIGHT child to anonymous disk blocks, then stream
+/// the LEFT child one row at a time, re-reading the right side from disk
+/// for each left row.
 ///
-/// Why right side in memory?  The right child is re-iterated for every left
-/// row, but iterators are single-pass.  Materialising right avoids having to
-/// re-open it.  If right is too large, a future upgrade can spill it to the
-/// anonymous disk region instead.
-///
-/// TODO: disk-backed nested-loop join for large right sides.
+/// This keeps memory usage to O(block_size) regardless of right-side size.
 pub struct CrossOperator<'q> {
     left: Box<dyn Operator<'q> + 'q>,
-    /// Right child — Some until the first `next()` call, then taken and drained.
     right: Option<Box<dyn Operator<'q> + 'q>>,
-    /// All rows from the right child, kept in memory.
-    right_buf: Vec<Row>,
-    /// The current left row being joined against every right row.
-    current_left: Option<Row>,
-    /// Index into `right_buf` for the next right row to pair with `current_left`.
-    right_idx: usize,
-    /// The disk handle — reserved for the future disk-backed upgrade.
-    #[allow(dead_code)]
     disk: SharedDisk,
     schema: Schema,
+    right_schema: Schema,
+
+    /// Block ID where the spilled right side starts.
+    right_start_block: u64,
+    /// Number of blocks spilled.
+    right_num_blocks: u64,
+
+    /// Current left row being joined.
+    current_left: Option<Row>,
+    /// Buffer of decoded right rows from the current disk block.
+    right_buf: Vec<Row>,
+    /// Which block of the right side we are currently reading (0-indexed).
+    right_block_idx: u64,
+    /// Index into right_buf.
+    right_row_idx: usize,
+
+    /// True once we have spilled the right side.
+    initialised: bool,
 }
 
 impl<'q> CrossOperator<'q> {
@@ -35,29 +39,89 @@ impl<'q> CrossOperator<'q> {
         right: Box<dyn Operator<'q> + 'q>,
         disk: SharedDisk,
     ) -> Self {
-        // Output schema = left columns followed by right columns.
-        // The spec guarantees that left and right child schemas have no name collisions.
         let mut schema = left.schema().clone();
-        schema.extend_from_slice(right.schema());
+        let right_schema = right.schema().clone();
+        schema.extend_from_slice(&right_schema);
 
         CrossOperator {
             left,
             right: Some(right),
-            right_buf: Vec::new(),
-            current_left: None,
-            right_idx: 0,
             disk,
             schema,
+            right_schema,
+            right_start_block: 0,
+            right_num_blocks: 0,
+            current_left: None,
+            right_buf: Vec::new(),
+            right_block_idx: 0,
+            right_row_idx: 0,
+            initialised: false,
         }
     }
 
-    /// Drain the right child into `right_buf`.  Called at most once.
-    fn init_right(&mut self) {
-        if let Some(mut right_child) = self.right.take() {
-            while let Some(row) = right_child.next() {
-                self.right_buf.push(row);
+    /// Spill the entire right child to anonymous disk blocks.
+    fn spill_right(&mut self) {
+        let mut right_child = self.right.take().unwrap();
+        let block_size = self.disk.borrow().block_size;
+        let usable = block_size - 2;
+
+        // We'll build blocks on the fly and write them as they fill up.
+        let mut current_block = vec![0u8; block_size];
+        let mut offset = 0usize;
+        let mut row_count: u16 = 0;
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+
+        while let Some(row) = right_child.next() {
+            let encoded = encode_row(&row);
+            if offset + encoded.len() > usable {
+                // Flush current block
+                let rc_bytes = (row_count as u16).to_le_bytes();
+                current_block[block_size - 2] = rc_bytes[0];
+                current_block[block_size - 1] = rc_bytes[1];
+                blocks.push(current_block);
+                current_block = vec![0u8; block_size];
+                offset = 0;
+                row_count = 0;
             }
-            // right_child dropped here
+            current_block[offset..offset + encoded.len()].copy_from_slice(&encoded);
+            offset += encoded.len();
+            row_count += 1;
+        }
+        // Flush final block (always emit at least one so we know right is empty if 0 rows)
+        let rc_bytes = (row_count as u16).to_le_bytes();
+        current_block[block_size - 2] = rc_bytes[0];
+        current_block[block_size - 1] = rc_bytes[1];
+        blocks.push(current_block);
+
+        // Write all blocks to anonymous region
+        let num_blocks = blocks.len() as u64;
+        let start = self.disk.borrow_mut().alloc_anon_blocks(num_blocks);
+        let mut flat: Vec<u8> = Vec::with_capacity(num_blocks as usize * block_size);
+        for b in blocks {
+            flat.extend_from_slice(&b);
+        }
+        self.disk.borrow_mut().write_blocks(start, &flat);
+
+        self.right_start_block = start;
+        self.right_num_blocks = num_blocks;
+    }
+
+    /// Load right rows from block `right_block_idx` into `right_buf`.
+    fn load_right_block(&mut self) {
+        let block_id = self.right_start_block + self.right_block_idx;
+        let raw = self.disk.borrow_mut().read_blocks(block_id, 1);
+        let block_size = self.disk.borrow().block_size;
+        self.right_buf = decode_block(&raw[..block_size], &self.right_schema);
+        self.right_row_idx = 0;
+    }
+
+    /// Rewind right side to beginning.
+    fn rewind_right(&mut self) {
+        self.right_block_idx = 0;
+        self.right_buf.clear();
+        self.right_row_idx = 0;
+        if self.right_num_blocks > 0 {
+            self.load_right_block();
         }
     }
 }
@@ -68,37 +132,42 @@ impl<'q> Operator<'q> for CrossOperator<'q> {
     }
 
     fn next(&mut self) -> Option<Row> {
-        // Lazy materialisation of the right side on the first call.
-        if self.right.is_some() {
-            self.init_right();
-        }
-
-        // If the right side is empty, the cross product is empty.
-        if self.right_buf.is_empty() {
-            return None;
+        // Spill right side on first call
+        if !self.initialised {
+            self.spill_right();
+            self.initialised = true;
+            if self.right_num_blocks == 0 {
+                return None;
+            }
+            self.load_right_block();
         }
 
         loop {
-            // Try to advance within the right buffer for the current left row.
             if let Some(ref left_row) = self.current_left {
-                if self.right_idx < self.right_buf.len() {
-                    // Concatenate left_row ++ right_row.
+                // Advance within current right block
+                if self.right_row_idx < self.right_buf.len() {
                     let mut combined = left_row.clone();
-                    combined.extend_from_slice(&self.right_buf[self.right_idx]);
-                    self.right_idx += 1;
+                    combined.extend_from_slice(&self.right_buf[self.right_row_idx]);
+                    self.right_row_idx += 1;
                     return Some(combined);
                 }
-                // All right rows exhausted for this left row — advance left.
+                // Try next right block
+                self.right_block_idx += 1;
+                if self.right_block_idx < self.right_num_blocks {
+                    self.load_right_block();
+                    continue;
+                }
+                // Right side exhausted for this left row — get next left row
                 self.current_left = None;
             }
 
-            // Fetch the next left row.
+            // Fetch next left row
             match self.left.next() {
                 Some(row) => {
                     self.current_left = Some(row);
-                    self.right_idx = 0;
+                    self.rewind_right();
                 }
-                None => return None, // Left exhausted — cross product done.
+                None => return None,
             }
         }
     }

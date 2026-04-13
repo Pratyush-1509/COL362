@@ -210,3 +210,43 @@ fn format_f64(v: f64) -> String {
         format!("{}", v)
     }
 }
+
+// ── Hashable key for hash join ───────────────────────────────────────────────
+
+use std::hash::{Hash, Hasher};
+
+#[derive(Clone)]
+pub struct DataKey(pub common::Data);
+
+impl PartialEq for DataKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (common::Data::Int32(a),   common::Data::Int32(b))   => a == b,
+            (common::Data::Int64(a),   common::Data::Int64(b))   => a == b,
+            (common::Data::Float32(a), common::Data::Float32(b)) => a.to_bits() == b.to_bits(),
+            (common::Data::Float64(a), common::Data::Float64(b)) => a.to_bits() == b.to_bits(),
+            (common::Data::String(a),  common::Data::String(b))  => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DataKey {}
+
+impl Hash for DataKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match &self.0 {
+            common::Data::Int32(v)   => { 0u8.hash(state); v.hash(state); }
+            common::Data::Int64(v)   => { 1u8.hash(state); v.hash(state); }
+            common::Data::Float32(v) => { 2u8.hash(state); v.to_bits().hash(state); }
+            common::Data::Float64(v) => { 3u8.hash(state); v.to_bits().hash(state); }
+            common::Data::String(s)  => { 4u8.hash(state); s.hash(state); }
+        }
+    }
+}
+
+pub type JoinKey = Vec<DataKey>;
+
+pub fn make_join_key(row: &Row, indices: &[usize]) -> JoinKey {
+    indices.iter().map(|&i| DataKey(row[i].clone())).collect()
+}

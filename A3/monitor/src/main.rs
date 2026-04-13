@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use libc::{rlimit64, setrlimit64};
+#[cfg(target_os = "linux")]
+use libc::{rlimit64 as rlimit, setrlimit64 as setrlimit};
+#[cfg(target_os = "macos")]
+use libc::{rlimit, setrlimit};
 use monitor_config::{
     MonitorConfig,
     monitor_config::{DatabaseConfig, QueryConfig},
@@ -68,29 +71,32 @@ fn setup_db_process(
                 FdMapping::new(db_to_monitor_writer.as_raw_fd(), 6, false),
             ]);
 
-            let mut rlimit = rlimit64 {
+            let mut rlimit = rlimit {
                 rlim_cur: memory_limit,
                 rlim_max: memory_limit,
             };
 
-            if setrlimit64(libc::RLIMIT_AS, &rlimit) != 0 {
-                panic!("Unable to set memory limit");
-            }
+            #[cfg(target_os = "linux")]
+            {
+                if setrlimit(libc::RLIMIT_AS, &rlimit) != 0 {
+                    panic!("Unable to set memory limit");
+                }
 
-            if setrlimit64(libc::RLIMIT_STACK, &rlimit) != 0 {
-                panic!("Unable to set stack limit");
-            }
+                if setrlimit(libc::RLIMIT_STACK, &rlimit) != 0 {
+                    panic!("Unable to set stack limit");
+                }
 
-            rlimit.rlim_cur = 0;
-            rlimit.rlim_max = 0;
-            if setrlimit64(libc::RLIMIT_FSIZE, &rlimit) != 0 {
-                panic!("Unable to set max file size limit");
-            }
+                rlimit.rlim_cur = 0;
+                rlimit.rlim_max = 0;
+                if setrlimit(libc::RLIMIT_FSIZE, &rlimit) != 0 {
+                    panic!("Unable to set max file size limit");
+                }
 
-            rlimit.rlim_cur = 1;
-            rlimit.rlim_max = 1;
-            if setrlimit64(libc::RLIMIT_NPROC, &rlimit) != 0 {
-                panic!("Unable to set max processes limit");
+                rlimit.rlim_cur = 1;
+                rlimit.rlim_max = 1;
+                if setrlimit(libc::RLIMIT_NPROC, &rlimit) != 0 {
+                    panic!("Unable to set max processes limit");
+                }
             }
 
             Ok(())

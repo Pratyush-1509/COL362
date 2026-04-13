@@ -131,3 +131,28 @@ fn column_index(schema: &Schema, name: &str) -> usize {
         .position(|(n, _)| n == name)
         .unwrap_or_else(|| panic!("FilterOperator: column '{}' not found in schema", name))
 }
+
+pub struct OwnedFilterOperator<'q> {
+    predicates: Vec<&'q Predicate>,
+    child: Box<dyn Operator<'q> + 'q>,
+    schema: Schema,
+}
+
+impl<'q> OwnedFilterOperator<'q> {
+    pub fn new(predicates: Vec<&'q Predicate>, child: Box<dyn Operator<'q> + 'q>) -> Self {
+        let schema = child.schema().clone();
+        OwnedFilterOperator { predicates, child, schema }
+    }
+}
+
+impl<'q> Operator<'q> for OwnedFilterOperator<'q> {
+    fn schema(&self) -> &Schema { &self.schema }
+    fn next(&mut self) -> Option<Row> {
+        loop {
+            let row = self.child.next()?;
+            if self.predicates.iter().all(|p| evaluate_predicate(&row, &self.schema, p)) {
+                return Some(row);
+            }
+        }
+    }
+}
