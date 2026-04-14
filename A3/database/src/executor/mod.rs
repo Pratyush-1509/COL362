@@ -92,16 +92,80 @@ fn build_leaf<'q>(
     }
 }
 
+/// Estimate how many disk blocks a leaf QueryOp reads.
+/// Recursively unwraps Filter/Project wrappers to reach the Scan.
+/// Used for join ordering: larger tables should be probe (left) side.
+fn scan_op_blocks(op: &QueryOp, ctx: &DbContext, disk: &SharedDisk) -> u64 {
+    match op {
+        QueryOp::Scan(data) => {
+            if let Some(spec) = ctx.get_table_specs().iter().find(|t| t.name == data.table_id) {
+                disk.borrow_mut().get_file_num_blocks(&spec.file_id)
+            } else {
+                0
+            }
+        }
+        QueryOp::Filter(data) => scan_op_blocks(&data.underlying, ctx, disk),
+        QueryOp::Project(data) => scan_op_blocks(&data.underlying, ctx, disk),
+        _ => 0,
+    }
+}
+
 fn build_join_tree<'q>(
     scan_ops: Vec<&'q QueryOp>,
     all_predicates: Vec<&'q Predicate>,
     ctx: &DbContext,
     disk: SharedDisk,
 ) -> Box<dyn Operator<'q> + 'q> {
-    let mut current = build_leaf(scan_ops[0], &all_predicates, ctx, Rc::clone(&disk));
+    let n = scan_ops.len();
 
-    for i in 1..scan_ops.len() {
-        let right = build_leaf(scan_ops[i], &all_predicates, ctx, Rc::clone(&disk));
+    // ── Join reordering ─────────────────────────────────────────────────────
+    // Pre-compute schemas and file-block counts for all leaf operators.
+    let schemas: Vec<Schema> = scan_ops
+        .iter()
+        .map(|op| build_operator(op, ctx, Rc::clone(&disk)).schema().clone())
+        .collect();
+    let scan_blocks: Vec<u64> = scan_ops
+        .iter()
+        .map(|op| scan_op_blocks(op, ctx, &disk))
+        .collect();
+
+    // Start with the LARGEST table so it becomes the streaming probe side.
+    // This ensures the large fact table (e.g. lineitem) is never the build
+    // side of a hash join, avoiding expensive grace-hash-join disk I/O.
+    let start = (0..n).max_by_key(|&i| scan_blocks[i]).unwrap_or(0);
+    let mut order: Vec<usize> = vec![start];
+    let mut remaining: Vec<usize> = (0..n).filter(|&i| i != start).collect();
+
+    while !remaining.is_empty() {
+        // Combined schema of the tables joined so far.
+        let combined: Schema = order
+            .iter()
+            .flat_map(|&i| schemas[i].iter().cloned())
+            .collect();
+
+        // Primary key: number of equi-join keys connecting this table to the
+        // current set (more is better — avoids cross products).
+        // Tie-break: larger table first so it goes on the probe side while
+        // still small enough to be build side here.
+        let best_pos = remaining
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &i)| {
+                let key_count = equi_join_keys(&all_predicates, &combined, &schemas[i]).len();
+                (key_count, scan_blocks[i])
+            })
+            .map(|(pos, _)| pos)
+            .unwrap();
+
+        order.push(remaining.remove(best_pos));
+    }
+
+    // ── Build join tree in reordered sequence ───────────────────────────────
+    let mut current = build_leaf(scan_ops[order[0]], &all_predicates, ctx, Rc::clone(&disk));
+
+    for step in 1..n {
+        let scan_idx = order[step];
+        let right = build_leaf(scan_ops[scan_idx], &all_predicates, ctx, Rc::clone(&disk));
         let left_schema = current.schema().clone();
         let right_schema = right.schema().clone();
 
@@ -111,7 +175,7 @@ fn build_join_tree<'q>(
             current = Box::new(cross::CrossOperator::new(current, right, Rc::clone(&disk)));
         } else {
             let join_keys_copy = join_keys.clone();
-            current = Box::new(hashjoin::HashJoinOperator::new(current, right, join_keys_copy));
+            current = Box::new(hashjoin::HashJoinOperator::new(current, right, join_keys_copy, Rc::clone(&disk)));
         }
 
         // Apply residual predicates now satisfiable (excluding used equi-join keys)
