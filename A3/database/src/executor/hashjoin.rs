@@ -8,18 +8,25 @@ use crate::row::{decode_block, make_join_key, rows_to_blocks, JoinKey, Row, Sche
 
 /// If the right (build) side stays within this byte budget, skip disk
 /// partitioning entirely and probe with a purely in-memory hash table.
-const INMEM_BUILD_BUDGET: usize = 16 * 1024 * 1024; // 16 MB
+///
+/// Conservative: RLIMIT_AS is 64 MB for the whole process.  A debug
+/// binary + dynamic libc/libm/ld account for ~20-25 MB of virtual space,
+/// and HashMap<JoinKey,Vec<Row>> uses ~2.5× the raw-data bytes (bucket
+/// array + per-entry Vec headers + String heap allocations).
+/// 4 MB × 2.5 = 10 MB HashMap heap + 25 MB base ≈ 35 MB → safe margin.
+const INMEM_BUILD_BUDGET: usize = 4 * 1024 * 1024; // 4 MB
 
 /// Number of hash partitions for the grace hash join fallback.
-/// With a 16 MB per-partition budget this handles right sides up to 256 MB.
-const NUM_PARTITIONS: usize = 16;
+/// 64 partitions × 4 MB budget ≈ 256 MB max build side (covers SF1).
+const NUM_PARTITIONS: usize = 64;
 
 /// Per-partition in-memory buffer before flushing to disk.
-const FLUSH_THRESHOLD: usize = 1 * 1024 * 1024; // 1 MB
+/// 64 × 256 KB = 16 MB peak partition memory — safe alongside other allocs.
+const FLUSH_THRESHOLD: usize = 256 * 1024; // 256 KB
 
 /// Number of blocks to read from disk in a single request.
 /// Batching amortises seek overhead and protocol round-trips.
-const READ_BATCH: u64 = 8;
+const READ_BATCH: u64 = 16;
 
 // ── Disk segment metadata ─────────────────────────────────────────────────────
 

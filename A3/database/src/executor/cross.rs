@@ -60,50 +60,86 @@ impl<'q> CrossOperator<'q> {
     }
 
     /// Spill the entire right child to anonymous disk blocks.
+    ///
+    /// Writes blocks in batches of SPILL_BATCH_BLOCKS to bound peak memory
+    /// to O(batch_size × block_size) instead of O(right_side_total_bytes).
     fn spill_right(&mut self) {
+        const SPILL_BATCH_BLOCKS: usize = 64; // 64 × 4 KB = 256 KB per write
+
         let mut right_child = self.right.take().unwrap();
         let block_size = self.disk.borrow().block_size;
         let usable = block_size - 2;
 
-        // We'll build blocks on the fly and write them as they fill up.
         let mut current_block = vec![0u8; block_size];
         let mut offset = 0usize;
         let mut row_count: u16 = 0;
-        let mut blocks: Vec<Vec<u8>> = Vec::new();
+
+        // Flat write buffer: holds up to SPILL_BATCH_BLOCKS blocks before flushing.
+        let mut write_buf: Vec<u8> = Vec::with_capacity(SPILL_BATCH_BLOCKS * block_size);
+        let mut total_blocks: u64 = 0;
+        let mut first_write = true;
+
+        let flush_batch = |disk: &crate::executor::SharedDisk,
+                               write_buf: &mut Vec<u8>,
+                               total_blocks: &mut u64,
+                               right_start_block: &mut u64,
+                               first_write: &mut bool| {
+            if write_buf.is_empty() {
+                return;
+            }
+            let n = (write_buf.len() / block_size) as u64;
+            let start = disk.borrow_mut().alloc_anon_blocks(n);
+            if *first_write {
+                *right_start_block = start;
+                *first_write = false;
+            }
+            disk.borrow_mut().write_blocks(start, write_buf);
+            *total_blocks += n;
+            write_buf.clear();
+        };
 
         while let Some(row) = right_child.next() {
             let encoded = encode_row(&row);
             if offset + encoded.len() > usable {
-                // Flush current block
+                // Seal the current block and add to write buffer.
                 let rc_bytes = (row_count as u16).to_le_bytes();
                 current_block[block_size - 2] = rc_bytes[0];
                 current_block[block_size - 1] = rc_bytes[1];
-                blocks.push(current_block);
+                write_buf.extend_from_slice(&current_block);
                 current_block = vec![0u8; block_size];
                 offset = 0;
                 row_count = 0;
+
+                // Flush the write buffer once it reaches the batch size.
+                if write_buf.len() >= SPILL_BATCH_BLOCKS * block_size {
+                    flush_batch(
+                        &self.disk,
+                        &mut write_buf,
+                        &mut total_blocks,
+                        &mut self.right_start_block,
+                        &mut first_write,
+                    );
+                }
             }
             current_block[offset..offset + encoded.len()].copy_from_slice(&encoded);
             offset += encoded.len();
             row_count += 1;
         }
-        // Flush final block (always emit at least one so we know right is empty if 0 rows)
+
+        // Seal and flush the final (possibly partial) block.
         let rc_bytes = (row_count as u16).to_le_bytes();
         current_block[block_size - 2] = rc_bytes[0];
         current_block[block_size - 1] = rc_bytes[1];
-        blocks.push(current_block);
+        write_buf.extend_from_slice(&current_block);
+        flush_batch(
+            &self.disk,
+            &mut write_buf,
+            &mut total_blocks,
+            &mut self.right_start_block,
+            &mut first_write,
+        );
 
-        // Write all blocks to anonymous region
-        let num_blocks = blocks.len() as u64;
-        let start = self.disk.borrow_mut().alloc_anon_blocks(num_blocks);
-        let mut flat: Vec<u8> = Vec::with_capacity(num_blocks as usize * block_size);
-        for b in blocks {
-            flat.extend_from_slice(&b);
-        }
-        self.disk.borrow_mut().write_blocks(start, &flat);
-
-        self.right_start_block = start;
-        self.right_num_blocks = num_blocks;
+        self.right_num_blocks = total_blocks;
     }
 
     /// Load right rows from block `right_block_idx` into `right_buf`.

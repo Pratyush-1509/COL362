@@ -92,13 +92,47 @@ fn build_leaf<'q>(
     }
 }
 
-/// Estimate how many disk blocks a leaf QueryOp reads.
+/// Estimate the physical size (file blocks) of a leaf QueryOp.
 /// Recursively unwraps Filter/Project wrappers to reach the Scan.
 /// Used for join ordering: larger tables should be probe (left) side.
+///
+/// If the table's stats include a CardinalityData entry we use the maximum
+/// cardinality across all columns as a row-count estimate (scaled to blocks
+/// via a conservative 128-byte/row assumption so it is comparable to
+/// get_file_num_blocks).  This avoids issuing extra disk-protocol commands
+/// while still benefiting from metadata on larger datasets.
+/// Falls back to get_file_num_blocks when no stats are available.
 fn scan_op_blocks(op: &QueryOp, ctx: &DbContext, disk: &SharedDisk) -> u64 {
     match op {
         QueryOp::Scan(data) => {
             if let Some(spec) = ctx.get_table_specs().iter().find(|t| t.name == data.table_id) {
+                // Try to read a cardinality stat from any column.
+                // The maximum cardinality across all columns is a lower bound
+                // on the number of rows (a column cannot have more distinct
+                // values than there are rows).  For fact tables like lineitem
+                // the PK-ish column (l_orderkey) has cardinality ≈ row count.
+                let mut max_card: u64 = 0;
+                for col in &spec.column_specs {
+                    if let Some(stats) = &col.stats {
+                        for stat in stats {
+                            if let db_config::statistics::ColumnStat::CardinalityStat(
+                                db_config::statistics::CardinalityData(count),
+                            ) = stat
+                            {
+                                if *count > max_card {
+                                    max_card = *count;
+                                }
+                            }
+                        }
+                    }
+                }
+                if max_card > 0 {
+                    // Convert row-count estimate to a synthetic block count
+                    // (128 bytes/row is conservative — avoids underestimating
+                    // wide tables like lineitem).
+                    return (max_card * 128).div_ceil(4096);
+                }
+                // Fall back to actual file size from the disk manager.
                 disk.borrow_mut().get_file_num_blocks(&spec.file_id)
             } else {
                 0

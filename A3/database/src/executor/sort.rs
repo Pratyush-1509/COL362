@@ -6,8 +6,9 @@ use crate::executor::{Operator, SharedDisk};
 use crate::row::{decode_block, rows_to_blocks, Row, Schema};
 
 /// Max in-memory row-data bytes before flushing a sorted run to disk.
-/// Conservative to stay well inside the 64 MB RLIMIT_AS limit.
-const RUN_BUDGET_BYTES: usize = 4 * 1024 * 1024; // 4 MB per run
+/// Reduced to leave headroom for concurrent hash-join tables and the
+/// program binary (~25 MB base overhead within 64 MB RLIMIT_AS).
+const RUN_BUDGET_BYTES: usize = 2 * 1024 * 1024; // 2 MB per run
 
 // ── Public operator ───────────────────────────────────────────────────────────
 
