@@ -247,6 +247,45 @@ fn build_join_tree<'q>(
     current
 }
 
+/// Returns true if the data under a Sort node is already in the required order,
+/// meaning the Sort can be skipped entirely.
+/// Conditions (all must hold):
+///   1. Every sort spec is ascending.
+///   2. Every sort column has IsPhysicallyOrdered in the db_config for the table.
+///   3. The source is a single table (Scan optionally wrapped in Filter/Project),
+///      not a join — physical ordering is lost after joining.
+fn sort_already_satisfied(underlying: &QueryOp, sort_specs: &[common::query::SortSpec], ctx: &DbContext) -> bool {
+    if sort_specs.iter().any(|s| !s.ascending) {
+        return false;
+    }
+
+    // Unwrap Filter/Project to find the base Scan; bail if we hit a join.
+    let mut cur = underlying;
+    loop {
+        match cur {
+            QueryOp::Scan(data) => {
+                // Check every sort column is IsPhysicallyOrdered for this table.
+                let Some(spec) = ctx.get_table_specs().iter().find(|t| t.name == data.table_id) else {
+                    return false;
+                };
+                return sort_specs.iter().all(|ss| {
+                    spec.column_specs.iter().any(|col| {
+                        col.column_name == ss.column_name
+                            && col.stats.as_ref().map_or(false, |stats| {
+                                stats.iter().any(|s| {
+                                    matches!(s, db_config::statistics::ColumnStat::IsPhysicallyOrdered)
+                                })
+                            })
+                    })
+                });
+            }
+            QueryOp::Filter(data) => cur = &data.underlying,
+            QueryOp::Project(data) => cur = &data.underlying,
+            _ => return false, // Cross/Sort/join subtree — physical order not guaranteed
+        }
+    }
+}
+
 pub fn build_operator<'q>(
     op: &'q QueryOp,
     ctx: &DbContext,
@@ -288,6 +327,9 @@ pub fn build_operator<'q>(
         }
 
         QueryOp::Sort(data) => {
+            if sort_already_satisfied(&data.underlying, &data.sort_specs, ctx) {
+                return build_operator(&data.underlying, ctx, disk);
+            }
             let child = build_operator(&data.underlying, ctx, Rc::clone(&disk));
             Box::new(sort::SortOperator::new(&data.sort_specs, child, Rc::clone(&disk)))
         }
