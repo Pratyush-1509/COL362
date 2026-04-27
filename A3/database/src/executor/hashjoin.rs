@@ -14,7 +14,7 @@ use crate::row::{decode_block, make_join_key, rows_to_blocks, JoinKey, Row, Sche
 /// and HashMap<JoinKey,Vec<Row>> uses ~2.5× the raw-data bytes (bucket
 /// array + per-entry Vec headers + String heap allocations).
 /// 4 MB × 2.5 = 10 MB HashMap heap + 25 MB base ≈ 35 MB → safe margin.
-const INMEM_BUILD_BUDGET: usize = 4 * 1024 * 1024; // 4 MB
+const INMEM_BUILD_BUDGET: usize = 6 * 1024 * 1024; // 6 MB
 
 /// Number of hash partitions for the grace hash join fallback.
 /// 64 partitions × 4 MB budget ≈ 256 MB max build side (covers SF1).
@@ -26,7 +26,7 @@ const FLUSH_THRESHOLD: usize = 256 * 1024; // 256 KB
 
 /// Number of blocks to read from disk in a single request.
 /// Batching amortises seek overhead and protocol round-trips.
-const READ_BATCH: u64 = 16;
+const READ_BATCH: u64 = 64;
 
 // ── Disk segment metadata ─────────────────────────────────────────────────────
 
@@ -282,6 +282,8 @@ impl<'q> HashJoinOperator<'q> {
                 right_bufs.push(part, row, &disk);
             }
         }
+        // Free the now-empty HashMap's bucket array before allocating left_bufs.
+        drop(hash_table);
         // Drain the remaining right rows from the operator.
         while let Some(row) = right.next() {
             let key = make_join_key(&row, &right_key_indices);
